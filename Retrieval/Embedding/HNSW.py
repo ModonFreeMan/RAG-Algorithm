@@ -112,18 +112,23 @@ class HNSW:
         self.nodes[node_id] = node
 
         # 2. 空图特殊处理
-        # 如果是空图，就在当前层创建node_id指针
+        # 第一个节点，直接设为入口点，无需建边
         if self.entry_point is None:
+            # 把这个节点设为全局入口点
             self.entry_point = node_id
+            # 更新图的最高层记录
             self.max_layer = node_layer
+            # 直接返回（因为没有其他节点可以建边）
             return
 
-        # 3. 初始化入口结点
-        curr_ep = [self.entry_point]  # 当前层的入口点集合
+        # 3. 初始化入口结点，从顶层入口点开始向下搜索
+        curr_ep = [self.entry_point]
 
-        # 从max_layer层开始，层贪心下降
+        # 高于 node_layer 的层：贪心下降
         for layer in range(self.max_layer, node_layer, -1):
+            # 获取当前层离 query 最近 ef 个 node_id
             results = self._search_layer(vector, curr_ep, ef=1, layer=layer)
+            # 把这个最近节点作为下一层的入口点，丢掉距离信息只保留 id
             curr_ep = [nid for _, nid in results]
 
         # 3b. node_layer 到 0 层：搜索 + 建边
@@ -133,7 +138,7 @@ class HNSW:
 
             # 启发式选出 M 个邻居（第 0 层用 M0）
             max_conn = self.M0 if layer == 0 else self.M
-            neighbors = self._select_neighbors_heuristic(vector, candidates, max_conn)
+            neighbors = self._select_neighbors_heuristic(vector, candidates, max_conn, layer, extend_candidates=False)
 
             # 建立双向连接
             node.neighbors[layer] = [nid for _, nid in neighbors]
@@ -214,7 +219,6 @@ class HNSW:
         找到距离 query 最近的 ef 个节点
         返回: [(dist, node_id), ...] ef 个最近候选，升序
         """
-        visited: Set[int] = set(entry_points)
 
         # 候选堆，dist 小的在堆顶，决定"下一个扩展谁"
         candidates: List[Tuple[float, int]] = []
@@ -224,17 +228,19 @@ class HNSW:
         for ep in entry_points:
             d = self._dist(query, ep)
             heapq.heappush(candidates, (d, ep))
-            heapq.heappush(results, (-d, ep))  # 最大堆
+            heapq.heappush(results, (-d, ep))
 
+        visited: Set[int] = set(entry_points)
         while candidates:
+            # 从 candidates 取最近节点 c
             c_dist, c_id = heapq.heappop(candidates)  # 最近的候选
 
-            # 如果候选比结果集中最远的还远，可以停止
+            # 如果候选比结果集中最远的还远，证明不可能再找到更近的了，停止
             worst_result_dist = -results[0][0]
             if c_dist > worst_result_dist:
                 break
 
-            # 遍历当前节点在该层的所有邻居
+            # 遍历 c 在该层的所有邻居 nb，判断是否可以加入扩展集
             for nb_id in self.nodes[c_id].neighbors[layer]:
                 if nb_id in visited:
                     continue
@@ -242,14 +248,14 @@ class HNSW:
 
                 nb_dist = self._dist(query, nb_id)
                 worst_result_dist = -results[0][0]
-
+                # 如果当前邻居距离更近或者结果集尚未满，可以直接加入
                 if nb_dist < worst_result_dist or len(results) < ef:
                     heapq.heappush(candidates, (nb_dist, nb_id))
                     heapq.heappush(results, (-nb_dist, nb_id))
                     # 超出 ef 则弹出最远的
                     if len(results) > ef:
                         heapq.heappop(results)
-
+        # 返回当前层距离 query 最近的 ef 个节点（升序）
         return sorted((-d, nid) for d, nid in results)
 
     def _select_neighbors_heuristic(
@@ -257,17 +263,26 @@ class HNSW:
             query: np.ndarray,
             candidates: List[Tuple[float, int]],
             M: int,
+            layer: int = 0,
             extend_candidates: bool = False,
     ) -> List[Tuple[float, int]]:
         """
         启发式邻居选择（论文 Algorithm 4）
         相比简单取最近 M 个，能更好地保证图的连通性和方向覆盖。
+        搜索路径完全依赖图的边。如果某个区域和入口点之间没有边相连，那个区域就完全不会被访问到。
+        入口点                        孤立区域
+        [B]─[A]─[q]                 [D]─[E]─[F]
+
+        搜索从入口出发，沿边扩展：
+        入口 → A → B → q → （q的邻居只有A,B，走投无路）
+
+        D、E、F 没有任何边连过来，整个区域对这次搜索不可见
         """
         # 扩展候选集（可选）
         if extend_candidates:
             extra: Set[int] = set()
             for _, c_id in candidates:
-                for nb in self.nodes[c_id].neighbors[0]:
+                for nb in self.nodes[c_id].neighbors[layer]:  # 修复：用传入的 layer 替代硬编码的 0
                     extra.add(nb)
             extra_candidates = [(self._dist(query, nb), nb) for nb in extra]
             candidates = sorted(set(candidates) | set(extra_candidates))
@@ -311,7 +326,7 @@ class HNSW:
         if len(neighbors) <= max_conn:
             return
         candidates = [(self._dist(node.vector, nb), nb) for nb in neighbors]
-        kept = self._select_neighbors_heuristic(node.vector, candidates, max_conn)
+        kept = self._select_neighbors_heuristic(node.vector, candidates, max_conn, layer=layer, extend_candidates=False)
         node.neighbors[layer] = [nid for _, nid in kept]
 
     # ──────────────────────────────────────────
