@@ -6,6 +6,13 @@ import math
 import time
 
 
+# 小世界网络（社会学）
+#         ↓ 用图结构做向量搜索，所有节点在同一层，早期节点成为枢纽，高维搜索容易局部最优
+#     NSW（2014）
+#         ↓ 加入跳表的分层思想，分层之后，早期节点的"枢纽"问题消失了——高层节点是随机分配的，不再依赖插入顺序。搜索时先在高层大步定位，再在低层精细搜索，整个过程稳定且高效。
+#     HNSW（2016）
+
+
 # ─────────────────────────────────────────────
 #  距离函数
 # ─────────────────────────────────────────────
@@ -106,29 +113,25 @@ class HNSW:
         assert vector.shape == (self.dim,), f"期望维度 {self.dim}，实际 {vector.shape}"
         assert node_id not in self.nodes, f"node_id {node_id} 已存在"
 
-        # 1. 随机决定该节点的最高层
+        # 1. 随机决定该节点的最高层，然后从该层到第 0 层全部存在
         node_layer = self._random_layer()
         node = Node(node_id, vector, node_layer)
         self.nodes[node_id] = node
 
         # 2. 空图特殊处理
-        # 第一个节点，直接设为入口点，无需建边
+        # 如果是空图，将第一个 Node 加入到最高层，并设置为入口点（后续有新的更高节点会更新entry_point）
         if self.entry_point is None:
-            # 把这个节点设为全局入口点
             self.entry_point = node_id
-            # 更新图的最高层记录
             self.max_layer = node_layer
-            # 直接返回（因为没有其他节点可以建边）
             return
 
-        # 3. 初始化入口结点，从顶层入口点开始向下搜索
+        # 3. 初始化入口点集合，是当前层搜索的起点，每层搜索完更新一次，带着上层找到的最近节点进入下一层
         curr_ep = [self.entry_point]
 
-        # 高于 node_layer 的层：贪心下降
+        # 从max_layer层开始，层贪心下降
         for layer in range(self.max_layer, node_layer, -1):
-            # 获取当前层离 query 最近 ef 个 node_id
+            # 3a. 获取当前层的最近邻（ef=1），更新入口点
             results = self._search_layer(vector, curr_ep, ef=1, layer=layer)
-            # 把这个最近节点作为下一层的入口点，丢掉距离信息只保留 id
             curr_ep = [nid for _, nid in results]
 
         # 3b. node_layer 到 0 层：搜索 + 建边
@@ -136,11 +139,9 @@ class HNSW:
             # 在当前层搜索 ef_construction 个候选邻居
             candidates = self._search_layer(vector, curr_ep, self.ef_construction, layer)
 
-            # 启发式选出 M 个邻居（第 0 层用 M0）
+            # 启发式选出 M 个邻居（第 0 层用 M0），建立双向连接
             max_conn = self.M0 if layer == 0 else self.M
-            neighbors = self._select_neighbors_heuristic(vector, candidates, max_conn, layer, extend_candidates=False)
-
-            # 建立双向连接
+            neighbors = self._select_neighbors_heuristic(vector, candidates, max_conn)
             node.neighbors[layer] = [nid for _, nid in neighbors]
             for _, nid in neighbors:
                 self.nodes[nid].neighbors[layer].append(node_id)
@@ -165,6 +166,7 @@ class HNSW:
         返回: [(distance, node_id), ...] 按距离升序
         """
         query = np.array(query, dtype=np.float32)
+        # 如果没有全局入口点，也就是说图为空，直接返回空结果
         if self.entry_point is None:
             return []
 
@@ -219,6 +221,7 @@ class HNSW:
         找到距离 query 最近的 ef 个节点
         返回: [(dist, node_id), ...] ef 个最近候选，升序
         """
+        visited: Set[int] = set(entry_points)
 
         # 候选堆，dist 小的在堆顶，决定"下一个扩展谁"
         candidates: List[Tuple[float, int]] = []
@@ -228,19 +231,17 @@ class HNSW:
         for ep in entry_points:
             d = self._dist(query, ep)
             heapq.heappush(candidates, (d, ep))
-            heapq.heappush(results, (-d, ep))
+            heapq.heappush(results, (-d, ep))  # 最大堆
 
-        visited: Set[int] = set(entry_points)
         while candidates:
-            # 从 candidates 取最近节点 c
             c_dist, c_id = heapq.heappop(candidates)  # 最近的候选
 
-            # 如果候选比结果集中最远的还远，证明不可能再找到更近的了，停止
+            # 如果候选比结果集中最远的还远，可以停止
             worst_result_dist = -results[0][0]
             if c_dist > worst_result_dist:
                 break
 
-            # 遍历 c 在该层的所有邻居 nb，判断是否可以加入扩展集
+            # 遍历当前节点在该层的所有邻居
             for nb_id in self.nodes[c_id].neighbors[layer]:
                 if nb_id in visited:
                     continue
@@ -248,14 +249,14 @@ class HNSW:
 
                 nb_dist = self._dist(query, nb_id)
                 worst_result_dist = -results[0][0]
-                # 如果当前邻居距离更近或者结果集尚未满，可以直接加入
+
                 if nb_dist < worst_result_dist or len(results) < ef:
                     heapq.heappush(candidates, (nb_dist, nb_id))
                     heapq.heappush(results, (-nb_dist, nb_id))
                     # 超出 ef 则弹出最远的
                     if len(results) > ef:
                         heapq.heappop(results)
-        # 返回当前层距离 query 最近的 ef 个节点（升序）
+
         return sorted((-d, nid) for d, nid in results)
 
     def _select_neighbors_heuristic(
@@ -268,50 +269,68 @@ class HNSW:
     ) -> List[Tuple[float, int]]:
         """
         启发式邻居选择（论文 Algorithm 4）
-        相比简单取最近 M 个，能更好地保证图的连通性和方向覆盖。
-        搜索路径完全依赖图的边。如果某个区域和入口点之间没有边相连，那个区域就完全不会被访问到。
-        入口点                        孤立区域
-        [B]─[A]─[q]                 [D]─[E]─[F]
 
-        搜索从入口出发，沿边扩展：
-        入口 → A → B → q → （q的邻居只有A,B，走投无路）
+        目标：从候选节点中选出 M 个邻居，覆盖 query 周围不同方向。
+        不是简单取最近的 M 个，因为最近的 M 个可能全挤在同一方向，
+        导致其他方向的节点搜索时不可达。
 
-        D、E、F 没有任何边连过来，整个区域对这次搜索不可见
+        判断标准：候选节点 e 是否提供了一个"新方向"？
+            保留：dist(e, query) < dist(e, 已选邻居)  → e 不靠近任何已选邻居，方向新
+            丢弃：dist(e, query) > dist(e, 已选邻居)  → e 夹在 query 和已选邻居之间，方向重叠
+
+        直觉示意：
+            保留：query ── 2.0 ── e           r   (e 和 r 不在同侧)
+            丢弃：query ── 2.0 ── e ── 0.5 ── r   (e 夹在中间，r 已覆盖这个方向)
         """
-        # 扩展候选集（可选）
+
+        # ── 可选：扩展候选集 ──────────────────────────────────────────────────
+        # 把每个候选节点在当前层的邻居也纳入候选池，扩大搜索范围。
+        # 候选集较小时开启可提升图质量，代价是额外的距离计算。默认关闭。
         if extend_candidates:
             extra: Set[int] = set()
             for _, c_id in candidates:
-                for nb in self.nodes[c_id].neighbors[layer]:  # 修复：用传入的 layer 替代硬编码的 0
+                # 收集候选节点在当前层的所有邻居
+                for nb in self.nodes[c_id].neighbors[layer]:
                     extra.add(nb)
+            # 计算这些邻居到 query 的距离，合并进候选集
             extra_candidates = [(self._dist(query, nb), nb) for nb in extra]
             candidates = sorted(set(candidates) | set(extra_candidates))
 
         result: List[Tuple[float, int]] = []
-        # 剩余候选（最小堆）
+
+        # 最小堆：每次取出离 query 最近的候选来判断
         W = list(candidates)
         heapq.heapify(W)
 
+        # 暂存被启发式规则淘汰的节点，result 不足 M 时用来兜底
         discarded: List[Tuple[float, int]] = []
 
+        # ── 主循环：逐个判断候选节点是否提供新方向 ───────────────────────────
         while W and len(result) < M:
-            e_dist, e_id = heapq.heappop(W)  # 距离 query 最近的候选
+            e_dist, e_id = heapq.heappop(W)  # 取出当前离 query 最近的候选 e
 
-            # 启发式：只有当 e 比已选邻居中任意一个更近时才加入
-            # 这样避免所有邻居都聚集在同一方向
+            # 检查 e 是否和已选邻居中的某个方向重叠
+            # 遍历所有已选邻居 r，计算 e 到 r 的距离
             closer_to_query_than_to_result = True
             for r_dist, r_id in result:
                 d_e_r = self._dist(self.nodes[e_id].vector, r_id)
+                # e 和 r 离 query 都很近，但 e 和 r 也互相很近
                 if d_e_r < e_dist:
+                    # e 离 r 比离 query 还近，并且因为 e 和 r 离得太近，e 无法为搜索带来新的方向，丢弃
+                    # r 已经能代表 e 所在的位置。
                     closer_to_query_than_to_result = False
                     break
 
             if closer_to_query_than_to_result:
+                # e 不靠近任何已选邻居，提供了新方向，加入结果
                 result.append((e_dist, e_id))
             else:
+                # e 方向重叠，暂存到 discarded 备用
                 discarded.append((e_dist, e_id))
 
-        # 如果结果不足 M，用丢弃的补充
+        # ── 兜底补充：连通性优先于多样性 ─────────────────────────────────────
+        # 启发式有时过于严格，所有候选都被丢弃导致邻居数不足 M。
+        # 邻居太少会让节点在搜索时走投无路，宁可要方向重叠的邻居也不能让节点孤立。
         for item in discarded:
             if len(result) >= M:
                 break
@@ -325,8 +344,10 @@ class HNSW:
         neighbors = node.neighbors[layer]
         if len(neighbors) <= max_conn:
             return
+        # 计算当前 node_id 所有邻居的距离
         candidates = [(self._dist(node.vector, nb), nb) for nb in neighbors]
-        kept = self._select_neighbors_heuristic(node.vector, candidates, max_conn, layer=layer, extend_candidates=False)
+        # 启发式选择保留的邻居
+        kept = self._select_neighbors_heuristic(node.vector, candidates, max_conn)
         node.neighbors[layer] = [nid for _, nid in kept]
 
     # ──────────────────────────────────────────
